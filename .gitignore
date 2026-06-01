@@ -1,2 +1,6 @@
 .DS_Store
 2_NESTML/.DS_Store
+2_NESTML/report
+2_NESTML/target
+2_NESTML/tsodyks_synapse.nestml
+2_NESTML/aeif_neuron.nestml
