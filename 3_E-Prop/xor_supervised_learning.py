@@ -1,5 +1,5 @@
 # %%
-"""import os
+import os
 import sys
 
 nest_root = "/home/camilojd/AA_Work/Sussex/nest_installations/nest_39"
@@ -10,7 +10,7 @@ os.environ["PYTHONPATH"] = site_packages + (f":{os.environ['PYTHONPATH']}" if os
 os.environ["PATH"] = bin_dir + (f":{os.environ['PATH']}" if os.environ.get("PATH") else "")
 
 if site_packages not in sys.path:
-    sys.path.insert(0, site_packages)"""
+    sys.path.insert(0, site_packages)
     
 import nest
 import numpy as np
@@ -82,6 +82,7 @@ class DataloaderXOR:
 # %%
 params_setup = {
     "resolution": 1.0,
+    "total_num_virtual_procs": 11,  # number of virtual processes, set in case of distributed computing
 }
 
 nest.ResetKernel()
@@ -94,14 +95,12 @@ epochs = 100
 iteration_steps = 900
 group_size = 1
 
-#eta_train = 0.01
-eta_train = 1e-4  # learning rate for training phase
-#eta_train = eta_train = 5e-3 * 0.01**2
+eta_train = 1e-4  # learning rate for training phase 5e-3 * 0.01**2
 eta_test = 0.0  # learning rate for test phase
 n_iter_validate_every = 10
-do_validation = False
+do_validation = True
 
-test_size = 0.1
+test_size = 0.2
 
 # Network parameters
 n_in = 2  # number of input neurons
@@ -166,6 +165,13 @@ params_common_syn_eprop = {
 nest.SetDefaults("eprop_synapse", params_common_syn_eprop)
 
 # %%
+
+def calculate_glorot_dist(fan_in, fan_out):
+    glorot_scale = 1.0 / max(1.0, (fan_in + fan_out) / 2.0)
+    glorot_limit = np.sqrt(3.0 * glorot_scale)
+    glorot_distribution = np.random.uniform(low=-glorot_limit, high=glorot_limit, size=(fan_in, fan_out))
+    return glorot_distribution
+
 class Network:
     def __init__(self, n_in, n_rec, n_out, delay, recorders):
         """
@@ -194,6 +200,8 @@ class Network:
             "loss": [],
             "iteration": [],
             "label": [],
+            "y_target": [],
+            "y_pred": []
         }
 
     def setup(self):
@@ -251,8 +259,8 @@ class Network:
             np.random.randn(self.n_in, self.n_rec).T / np.sqrt(self.n_in))
         self.params_syn_in = {
             **params_syn_eprop,
-            "weight": nest.random.normal(0.0, self.n_in), 
-            #"weight": weights_in_rec, 
+            "weight": weights_in_rec, 
+            #"weight": nest.random.normal(0.0, self.n_in), 
         }
         # Rec - Rec
         weights_rec_rec = np.array(
@@ -264,12 +272,6 @@ class Network:
         }
 
         # Rec - Out
-        def calculate_glorot_dist(fan_in, fan_out):
-            glorot_scale = 1.0 / max(1.0, (fan_in + fan_out) / 2.0)
-            glorot_limit = np.sqrt(3.0 * glorot_scale)
-            glorot_distribution = np.random.uniform(low=-glorot_limit, high=glorot_limit, size=(fan_in, fan_out))
-            return glorot_distribution
-        
         weights_rec_out = np.array(
             calculate_glorot_dist(self.n_rec, self.n_out).T) * scale_factor
         self.params_syn_out = {
@@ -333,7 +335,6 @@ class Network:
             self.params_syn_static)  # connection 1
 
         # Should this connections be sparse?? (2,3,4)
-        
         nest.Connect(
             self.nrns_in, 
             self.nrns_rec,
@@ -434,10 +435,15 @@ class Network:
         accuracy = np.mean((y_target == y_prediction), axis=1)
         errors = 1.0 - accuracy
 
+        if (epoch % 5 == 0) or phase_label == "validation":
+            print(f"Reporting {phase_label} in epoch {epoch}: Loss {loss.item():.4f} | Error {errors.item()}")
+
         self.results_dict["iteration"].append(epoch)
         self.results_dict["error"].extend(errors)
         self.results_dict["loss"].extend(loss)
         self.results_dict["label"].append(phase_label)
+        self.results_dict["y_target"].append(y_target)
+        self.results_dict["y_pred"].append(y_prediction)
 
 # %%
 net = Network(n_in, n_rec, n_out, params_setup["resolution"], recorders)
@@ -527,12 +533,30 @@ def run_phase(
     nest.Simulate(duration_sim)
 
 # %%
+def select_result_phase(results_dict, label):
+    mask = np.array(np.array(net.results_dict["label"])) == label
+    it = np.array(net.results_dict["iteration"])[mask]
+    loss = np.array(net.results_dict["loss"])[mask]
+    error = np.array(net.results_dict["error"])[mask]
+    y_target = np.array(net.results_dict["y_target"])[mask]
+    y_pred = np.array(net.results_dict["y_pred"])[mask]
+    return {
+        "it": it, 
+        "loss": loss, 
+        "error": error, 
+        "y_target": y_target, 
+        "y_pred": y_pred
+    }
+
 # Training
+print("Starting train phase")
+print("----------------------")
 epoch = 0
 for data, target in train_loader:
     phase_label = "train"
     # Variable train learning rate?
-    #if epoch % 20 == 0:
+    if epoch % 20 == 0:
+        print(f"Epoch {epoch}/{len(train_loader)}")
     #    eta_train = eta_train / 10
     params_common_syn_eprop["optimizer"]["eta"] = eta_train
     # Validation
@@ -554,8 +578,25 @@ for data, target in train_loader:
         phase_label=phase_label
     )
     epoch += 1
+print()
+print("Training phase finished")
+print("----------------------")
+train_curve = select_result_phase(net.results_dict, "train")
+val_curve = select_result_phase(net.results_dict, "validation")
+train_id_min = np.argmin(train_curve['loss'])
+val_id_min = np.argmin(val_curve['loss'])
+print(f"Total epochs: {epoch}")
+print(f"Train last iteration: {train_curve['it'][-1]} | loss: {train_curve['loss'][-1]:.4f}")
+print(f"Val last iteration: {val_curve['it'][-1]} | loss: {val_curve['loss'][-1]:.4f}")
+print(f"Train best iteration: {train_curve['it'][train_id_min]} | loss: {train_curve['loss'][train_id_min]:.4f}")
+print(f"Val best iteration: {val_curve['it'][val_id_min]} | loss: {val_curve['loss'][val_id_min]:.4f}")
+print("----------------------")
+print()
 
+# %%
 # Testing
+print("Starting test phase")
+print("----------------------")
 for data, target in test_loader:
     phase_label = "test"
     params_common_syn_eprop["optimizer"]["eta"] = eta_test
@@ -639,13 +680,10 @@ df_rec_out = df_wr.loc[df_wr.index.intersection(rec_out_idx)]
 
 def plot_weight_time_course(df, ax, label=""):
     for i, idx in enumerate(df.index.unique()):
-        df_filt = df.loc[idx]#.sort_values(by="time_ms")
+        df_filt = df.loc[idx]
         ax.plot(df_filt["times"], df_filt["weights"], "-", 
-                label=idx, 
-                #color=color, 
-                #alpha=0.9*(i+1)/(len(df.index.unique()))
+                label=f"{idx}",
         )
-
 
 # %%
 rows = 12
@@ -685,7 +723,7 @@ for sender in np.unique(df_in.index):
     spk_times = df_in.loc[sender]
     axs[3].plot(spk_times, np.ones_like(spk_times) * sender, ".")
 for epoch in range(epochs):
-    axs[3].axvline(x=epoch * iteration_steps * params_setup["resolution"], color="k")
+    axs[3].axvline(x=group_size * epoch * iteration_steps * params_setup["resolution"], color="k")
 axs[3].set_ylabel("ID")
 axs[3].set_title(r"Input Spike Times $z_i$")
 axs[3].grid()
@@ -718,10 +756,10 @@ for i, sender in enumerate(np.unique(df_out.index)):
     mm_out_sender = df_out.loc[sender]
     axs[8].plot(mm_out_sender["times"], mm_out_sender["target_signal"])
 #for epoch in range(epochs):
-#    axs[8].axvline(x=epoch * iteration_steps * params_setup["resolution"], linestyle="--", color="k")
+#    axs[8].axvline(x=group_size * epoch * iteration_steps * params_setup["resolution"], linestyle="--", color="k")
 axs[8].set_ylabel("Signal")
 axs[8].set_title(r"Target $y^*_k$")
-axs[8].legend(loc="upper right")
+#axs[8].legend(loc="upper right")
 axs[8].grid()
 
 # Readout signal
@@ -729,7 +767,7 @@ for i, sender in enumerate(np.unique(df_out.index)):
     mm_out_sender = df_out.loc[sender]
     axs[9].plot(mm_out_sender["times"], mm_out_sender["readout_signal"], label=sender)
 #for epoch in range(epochs):
-#    axs[9].axvline(x=epoch * iteration_steps * params_setup["resolution"], linestyle="--", color="k")
+#    axs[9].axvline(x=group_size * epoch * iteration_steps * params_setup["resolution"], linestyle="--", color="k")
 axs[9].set_ylabel("Signal")
 axs[9].set_title(r"Readout signal $y_k$")
 axs[9].legend(loc="upper right")
@@ -741,7 +779,7 @@ for i, sender in enumerate(np.unique(df_out.index)):
     axs[10].plot(mm_out_sender["times"], mm_out_sender["error_signal"])
 axs[10].set_ylabel("Signal")
 axs[10].set_title(r"Error signal $y_k-y^*_k$")
-axs[10].legend(loc="upper right")
+#axs[10].legend(loc="upper right")
 axs[10].grid()
 
 for i, sender in enumerate(np.unique(df_mm_rec.index)):
@@ -757,22 +795,67 @@ plt.tight_layout()
 
 
 # %%
+# Learning curves
+train_curve = select_result_phase(net.results_dict, "train")
+val_curve = select_result_phase(net.results_dict, "validation")
+test_curve = select_result_phase(net.results_dict, "test") 
+
 fig, ax = plt.subplots(2, 1, figsize=(10,5), sharex=True)
-#ax[0].plot(
-#    np.arange(iteration_steps, iteration_steps * epochs) * params_setup["resolution"], 
-#    np.repeat(net.results_dict["loss"], iteration_steps))
-ax[0].plot(net.results_dict["loss"])
+ax[0].plot(train_curve["it"], train_curve["loss"], "*-", label="train")
+ax[0].plot(val_curve["it"], val_curve["loss"], "*-", label="val")
+ax[0].plot(test_curve["it"], test_curve["loss"], "*-", label="test")
 ax[0].grid()
+ax[0].set_ylabel(r"$\frac{1}{K,N}\,\mathrm{\sum_{k,n}}\left(\sum_t\left(y_t - y_t^{*}\right)^2\right)$")
+ax[0].legend(loc="upper right")
 ax[0].set_title("Loss")
 
-#ax[1].plot(
-#    np.arange(iteration_steps, iteration_steps * epochs) * params_setup["resolution"], 
-#    np.repeat(net.results_dict["error"], iteration_steps)
-#    )
-ax[1].plot(net.results_dict["error"])
+
+ax[1].plot(train_curve["it"], train_curve["error"], "*-", label="train")
+ax[1].plot(val_curve["it"], val_curve["error"], "*-", label="val")
+ax[1].plot(test_curve["it"], test_curve["error"], "*-", label="test")
 ax[1].grid()
 ax[1].set_title("Error")
-ax[1].set_xlabel("Time")
+ax[1].set_ylabel(r"$1 - \frac{1}{N}\,\mathrm{\sum_n}\left(\mathbf{1}(y^{*}=\hat{y})\right)$")
+ax[1].legend(loc="upper right")
+ax[1].set_xlabel("Epoch")
+
+# %%
+def compute_confusion_matrix(y_pred, y_target):
+    tp, tn, fp, fn = 0, 0, 0, 0
+    for y_p, y_t in zip(y_pred, y_target):
+        if y_t == 1:
+            if y_p == 1:
+                tp += 1
+            else:
+                fn += 1
+        elif y_t == 0:
+            if y_p == 1:
+                fp += 1
+            else:
+                tn += 1
+    return np.array([[tp, fn], [fp, tn]])
+
+y_pred = np.array(test_curve["y_pred"]).squeeze()
+y_target = np.array(test_curve["y_target"]).squeeze()
+conf_matrix = compute_confusion_matrix(y_pred, y_target)
+print("Confusion matrix")
+print(conf_matrix)
+
+# Plot confusion matrix (rows: true label [1,0], cols: predicted label [1,0])
+fig_cm, ax_cm = plt.subplots(figsize=(4, 4))
+im = ax_cm.imshow(conf_matrix, interpolation='nearest', cmap='Blues')
+for i in range(conf_matrix.shape[0]):
+    for j in range(conf_matrix.shape[1]):
+        ax_cm.text(j, i, f"{conf_matrix[i, j]:d}", ha='center', va='center',
+                   color='white' if conf_matrix[i, j] > conf_matrix.max() / 2 else 'black')
+ax_cm.set_xlabel('Predicted label')
+ax_cm.set_ylabel('True label')
+ax_cm.set_xticks([0, 1])
+ax_cm.set_yticks([0, 1])
+ax_cm.set_xticklabels(['1', '0'])
+ax_cm.set_yticklabels(['1', '0'])
+ax_cm.set_title('Confusion Matrix')
+fig_cm.colorbar(im, ax=ax_cm)
+plt.tight_layout()
+
 plt.show()
-
-
